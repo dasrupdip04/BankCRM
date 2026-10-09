@@ -3,8 +3,9 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt import PyJWKClient, decode
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.db import get_db
-from app.models import ApplicationUser
+from app.models import ApplicationUser, Role, AuditLog
 from app.settings import settings
 
 bearer = HTTPBearer(auto_error=False)
@@ -26,7 +27,28 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     user = db.query(ApplicationUser).filter_by(supabase_sub=subject).first()
     if not user:
         user = ApplicationUser(supabase_sub=subject, email=claims.get("email"))
-        db.add(user); db.commit(); db.refresh(user)
+        try:
+            db.add(user); db.flush()
+            customer_role = db.query(Role).filter_by(name="customer").first()
+            if not customer_role:
+                customer_role = Role(name="customer"); db.add(customer_role); db.flush()
+            user.roles = [customer_role]
+            db.commit(); db.refresh(user)
+        except IntegrityError:
+            # Concurrent first sign-ins may race on the unique Supabase subject.
+            db.rollback()
+            user = db.query(ApplicationUser).filter_by(supabase_sub=subject).first()
+            if user is None: raise HTTPException(503,"User synchronization failed; retry sign-in") from None
+    elif not user.roles:
+        # Legacy synced users receive only the least-privileged default role.
+        customer_role = db.query(Role).filter_by(name="customer").first()
+        if not customer_role:
+            customer_role = Role(name="customer"); db.add(customer_role); db.flush()
+        user.roles = [customer_role]
+        db.commit(); db.refresh(user)
+    if claims.get("email") and user.email != claims["email"]:
+        user.email = claims["email"]
+        db.commit()
     return user
 
 def require_roles(*names: str):

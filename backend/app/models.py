@@ -57,6 +57,7 @@ class Account(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     customer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("customers.id"), index=True)
     account_number: Mapped[str] = mapped_column(String(24), unique=True)
+    account_type: Mapped[str] = mapped_column(String(24), default="checking")
     currency: Mapped[str] = mapped_column(String(3))
     status: Mapped[str] = mapped_column(String(24), default="active")
     balance: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"))
