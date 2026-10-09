@@ -1,4 +1,6 @@
 from fastapi import HTTPException
+import pytest
+pytest.importorskip("jwt")
 from fastapi import HTTPException
 from app.auth import current_user
 

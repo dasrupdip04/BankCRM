@@ -14,6 +14,7 @@ app = FastAPI(title="Banking Core Operations API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 ROLES = ("customer", "teller", "operations", "compliance_officer", "auditor", "administrator")
 MANAGER_ROLES = {"administrator", "operations", "teller", "compliance_officer", "auditor"}
+TRANSFER_MANAGER_ROLES = {"administrator", "operations", "teller"}
 
 @app.get("/health")
 def health(): return {"status": "ok"}
@@ -23,8 +24,14 @@ def db_health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1")); return {"status": "ok", "database": "connected"}
 
 @app.get("/api/me")
-def me(user: ApplicationUser = Depends(current_user)):
-    return {"id": str(user.id), "email": user.email, "roles": [r.name for r in user.roles]}
+def me(user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
+    customer = db.query(Customer).filter_by(user_id=user.id).first()
+    profile = None
+    if customer:
+        latest_kyc = db.query(KYCRecord).filter_by(customer_id=customer.id).order_by(KYCRecord.submitted_at.desc()).first()
+        profile = {"id": str(customer.id), "status": customer.status, "kyc_status": latest_kyc.status if latest_kyc else "not_submitted", "kyc_approved": bool(latest_kyc and latest_kyc.status == "approved")}
+    unlinked_matches=db.query(Customer.id).filter(Customer.user_id.is_(None),func.lower(Customer.email)==(user.email or "").lower()).limit(2).all() if user.email else []
+    return {"id": str(user.id), "email": user.email, "roles": [r.name for r in user.roles], "customer_profile": profile, "unlinked_profile_match_count": len(unlinked_matches)}
 
 @app.get("/api/dashboard")
 def dashboard(user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
@@ -45,12 +52,58 @@ def create_customer(data: CustomerCreate, user: ApplicationUser = Depends(requir
     roles = {r.name for r in user.roles}
     is_customer = "customer" in roles and not roles.intersection(MANAGER_ROLES)
     if is_customer and db.query(Customer.id).filter_by(user_id=user.id).first(): raise HTTPException(409, "Customer profile already exists")
-    if not is_customer and db.query(Customer.id).filter_by(email=data.email).first(): raise HTTPException(409, "A customer profile already exists for this email")
-    customer = Customer(user_id=user.id if is_customer else None, full_name=data.full_name, email=(user.email or data.email) if is_customer else data.email, status="pending")
+    email = (user.email or data.email) if is_customer else data.email
+    if not is_customer:
+        existing_profiles = db.query(Customer).filter(func.lower(Customer.email) == email.lower()).limit(2).all()
+        if len(existing_profiles) > 1: raise HTTPException(409, "Multiple customer profiles exist for this email; resolve the duplicate before linking")
+        existing = existing_profiles[0] if existing_profiles else None
+        if existing:
+            if existing.user_id is None:
+                _link_customer_to_matching_user(existing, user, db)
+                db.commit()
+                return {"id": str(existing.id), "name": existing.full_name, "email": existing.email, "status": existing.status, "linked_existing_profile": True}
+            raise HTTPException(409, "A customer profile already exists for this email")
+        matching_users = db.query(ApplicationUser).filter(func.lower(ApplicationUser.email) == email.lower()).limit(2).all()
+        if len(matching_users) > 1: raise HTTPException(409, "Multiple application users match this email; resolve the duplicate before linking")
+        matched_user = matching_users[0] if matching_users else None
+        if matched_user and db.query(Customer.id).filter(Customer.user_id == matched_user.id).first():
+            raise HTTPException(409, "This application user already has a customer profile")
+    customer = Customer(user_id=user.id if is_customer else (matched_user.id if matched_user else None), full_name=data.full_name, email=email, status="pending")
     db.add(customer); db.flush()
     db.add(AuditLog(actor_id=user.id, action="customer.created", entity_type="customer", entity_id=str(customer.id)))
+    if not is_customer and matched_user:
+        db.add(AuditLog(actor_id=user.id, action="customer.linked_to_application_user", entity_type="customer", entity_id=str(customer.id), details={"application_user_id": str(matched_user.id)}))
     db.commit(); db.refresh(customer)
     return {"id": str(customer.id), "name": customer.full_name, "email": customer.email, "status": customer.status}
+
+def _link_customer_to_matching_user(customer: Customer, actor: ApplicationUser, db: Session):
+    if customer.user_id:
+        raise HTTPException(409, "Customer profile is already linked to an application user")
+    duplicate_profiles=db.query(Customer.id).filter(func.lower(Customer.email)==customer.email.lower(),Customer.id!=customer.id).limit(1).first()
+    if duplicate_profiles: raise HTTPException(409,"Multiple customer profiles use this email; resolve the duplicate before linking")
+    matches = db.query(ApplicationUser).filter(func.lower(ApplicationUser.email) == customer.email.lower()).limit(2).all()
+    if len(matches) != 1:
+        raise HTTPException(409, "No unique signed-in application user matches this customer email")
+    matched_user = matches[0]
+    existing = db.query(Customer.id).filter(Customer.user_id == matched_user.id, Customer.id != customer.id).first()
+    if existing:
+        raise HTTPException(409, "This application user already has a different customer profile")
+    customer.user_id = matched_user.id
+    db.add(AuditLog(actor_id=actor.id, action="customer.linked_to_application_user", entity_type="customer", entity_id=str(customer.id), details={"application_user_id": str(matched_user.id)}))
+    return matched_user
+
+@app.post("/api/customers/{customer_id}/link-application-user")
+def link_customer_application_user(customer_id: uuid.UUID, user: ApplicationUser = Depends(require_roles("administrator", "operations")), db: Session = Depends(get_db)):
+    customer = db.execute(select(Customer).where(Customer.id == customer_id).with_for_update()).scalar_one_or_none()
+    if not customer: raise HTTPException(404, "Customer not found")
+    if customer.user_id:
+        linked = db.get(ApplicationUser, customer.user_id)
+        if linked and linked.email and linked.email.lower() == customer.email.lower():
+            return {"id": str(customer.id), "user_id": str(linked.id), "linked": True}
+        raise HTTPException(409, "Customer profile is already linked to a different application user")
+    matched_user = _link_customer_to_matching_user(customer, user, db)
+    db.commit()
+    return {"id": str(customer.id), "user_id": str(matched_user.id), "linked": True}
 
 @app.get("/api/customers")
 def list_customers(user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
@@ -128,7 +181,7 @@ def fund_account(account_id: uuid.UUID, data: FundingCreate, idempotency_key: st
     clearing=db.query(Account).filter_by(account_type="system_clearing",currency=target.currency,status="active").first()
     if not clearing: raise HTTPException(409,"No active system clearing account; seed demo records first")
     payload=TransferCreate(source_account_id=clearing.id,destination_account_id=target.id,amount=amount,currency=target.currency,reference="DEMO-FUNDING")
-    result=transfer(payload,idempotency_key,user,db)
+    result=_post_transfer(payload,idempotency_key,user,db,allow_system_clearing=True)
     prior_funding=any(a.details.get("transfer_id")==result["id"] for a in db.query(AuditLog).filter_by(action="account.funded",entity_id=str(target.id)).all())
     if not prior_funding:
         db.add(AuditLog(actor_id=user.id,action="account.funded",entity_type="account",entity_id=str(target.id),details={"transfer_id":result["id"],"amount":str(amount),"currency":target.currency,"source":"system_clearing"})); db.commit()
@@ -136,10 +189,87 @@ def fund_account(account_id: uuid.UUID, data: FundingCreate, idempotency_key: st
 
 @app.get("/api/accounts")
 def list_accounts(user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
-    roles = {r.name for r in user.roles}; q = db.query(Account)
+    roles = {r.name for r in user.roles}; q = db.query(Account, Customer).join(Customer, Customer.id == Account.customer_id)
     if not roles.intersection(MANAGER_ROLES):
-        q = q.join(Customer).filter(Customer.user_id == user.id)
-    return [{"id": str(a.id), "account_number": a.account_number, "customer_id": str(a.customer_id), "customer_name": db.get(Customer,a.customer_id).full_name, "account_type": a.account_type, "currency": a.currency, "balance": str(a.balance), "status": a.status} for a in q.order_by(Account.created_at.desc()).limit(500)]
+        q = q.filter(Customer.user_id == user.id)
+    rows=q.order_by(Account.created_at.desc()).limit(500).all()
+    ledger_balances=_posted_ledger_balances(db,[a for a,_ in rows])
+    result=[]
+    for account,customer in rows:
+        available=ledger_balances.get(account.id,Decimal("0.00"))
+        reasons=_source_account_ineligibility(account,customer,available)
+        result.append({"id":str(account.id),"account_number":account.account_number,"customer_id":str(account.customer_id),"customer_name":customer.full_name,"customer_status":customer.status,"account_type":account.account_type,"currency":account.currency,"balance":str(account.balance),"available_balance":str(available),"status":account.status,"eligible_for_transfer_source":not reasons,"transfer_source_ineligibility_reasons":reasons})
+    return result
+
+def _posted_ledger_balances(db: Session, accounts: list[Account]) -> dict[uuid.UUID, Decimal]:
+    if not accounts: return {}
+    ids=[account.id for account in accounts]
+    sums=db.query(LedgerEntry.account_id,LedgerEntry.direction,func.sum(LedgerEntry.amount)).join(LedgerTransaction,LedgerTransaction.id==LedgerEntry.transaction_id).filter(LedgerTransaction.status=="posted",LedgerEntry.account_id.in_(ids)).group_by(LedgerEntry.account_id,LedgerEntry.direction).all()
+    totals={account_id:{"debit":Decimal("0.00"),"credit":Decimal("0.00")} for account_id in ids}
+    for account_id,direction,amount in sums:
+        totals[account_id][direction]=amount or Decimal("0.00")
+    return {account.id: (totals[account.id]["debit"]-totals[account.id]["credit"] if account.account_type=="system_clearing" else totals[account.id]["credit"]-totals[account.id]["debit"]) for account in accounts}
+
+def _source_account_ineligibility(account: Account, customer: Customer, available: Decimal) -> list[str]:
+    reasons=[]
+    if account.account_type=="system_clearing": reasons.append("system_clearing_account")
+    if account.status!="active": reasons.append(f"account_{account.status}")
+    if customer.status!="active": reasons.append("customer_profile_not_active")
+    if available<=Decimal("0.00"): reasons.append("no_posted_ledger_funds")
+    if available!=account.balance: reasons.append("ledger_balance_projection_mismatch")
+    return reasons
+
+@app.get("/api/admin/customers/{customer_id}/transfer-diagnostics")
+def customer_transfer_diagnostics(customer_id: uuid.UUID, user: ApplicationUser = Depends(require_roles("administrator","operations")), db: Session = Depends(get_db)):
+    customer=db.get(Customer,customer_id)
+    if not customer: raise HTTPException(404,"Customer not found")
+    return _transfer_diagnostic_for_customer(db,customer)
+
+def _transfer_diagnostic_for_customer(db: Session, customer: Customer, expected_user: ApplicationUser | None = None):
+    linked_user=db.get(ApplicationUser,customer.user_id) if customer.user_id else None
+    linked_email_matches=bool(linked_user and linked_user.email and customer.email and linked_user.email.lower()==customer.email.lower())
+    latest_kyc=db.query(KYCRecord).filter_by(customer_id=customer.id).order_by(KYCRecord.submitted_at.desc()).first()
+    reviews=db.query(KYCReview).filter_by(kyc_id=latest_kyc.id).order_by(KYCReview.created_at.desc()).first() if latest_kyc else None
+    accounts=db.query(Account).filter_by(customer_id=customer.id).order_by(Account.created_at.desc()).all()
+    ledger_balances=_posted_ledger_balances(db,accounts)
+    account_rows=[]
+    for account in accounts:
+        available=ledger_balances.get(account.id,Decimal("0.00"))
+        reasons=_source_account_ineligibility(account,customer,available)
+        if not customer.user_id: reasons.append("customer_profile_not_linked_to_application_user")
+        if expected_user and customer.user_id!=expected_user.id: reasons.append("account_not_attached_to_signed_in_customer_profile")
+        account_rows.append({"id":str(account.id),"account_number":account.account_number,"status":account.status,"currency":account.currency,"available_balance":str(available),"balance_projection":str(account.balance),"eligible_for_transfer_source":not reasons,"ineligibility_reasons":reasons})
+    matches=db.query(ApplicationUser.id).filter(func.lower(ApplicationUser.email)==(customer.email or "").lower()).limit(2).all()
+    same_email_profiles=db.query(Customer.id).filter(func.lower(Customer.email)==(customer.email or "").lower()).limit(2).all()
+    link_status=("linked" if linked_email_matches else "linked_email_mismatch") if linked_user else ("unique_email_match_available" if len(matches)==1 else "ambiguous_email_match" if len(matches)>1 else "no_unique_email_match")
+    if len(same_email_profiles)>1: link_status="duplicate_customer_profiles"
+    if expected_user and customer.user_id not in (None,expected_user.id): link_status="linked_to_different_application_user"
+    return {"customer_id":str(customer.id),"customer_email":customer.email,"customer_status":customer.status,"application_user_id":str(linked_user.id) if linked_user else None,"application_user_email":linked_user.email if linked_user else None,"linked_email_matches_customer":linked_email_matches,"profile_link_status":link_status,"kyc":{"status":latest_kyc.status if latest_kyc else "not_submitted","approved":bool(latest_kyc and latest_kyc.status=="approved"),"review_decision":reviews.decision if reviews else None},"accounts":account_rows}
+
+@app.get("/api/admin/users/{application_user_id}/transfer-diagnostics")
+def user_transfer_diagnostics(application_user_id: uuid.UUID, user: ApplicationUser = Depends(require_roles("administrator","operations")), db: Session = Depends(get_db)):
+    target=db.get(ApplicationUser,application_user_id)
+    if not target: raise HTTPException(404,"Application user not found")
+    profiles=db.query(Customer).filter((Customer.user_id==target.id)|(func.lower(Customer.email)==(target.email or "").lower())).order_by(Customer.created_at.desc()).limit(20).all()
+    return {"application_user_id":str(target.id),"application_user_email":target.email,"profile_count":len(profiles),"profiles":[_transfer_diagnostic_for_customer(db,customer,target) for customer in profiles]}
+
+@app.get("/api/transfer-destinations")
+def transfer_destinations(source_account_id: uuid.UUID, user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
+    source=db.get(Account,source_account_id)
+    if not source: raise HTTPException(404,"Source account not found")
+    roles={r.name for r in user.roles}
+    if source.account_type=="system_clearing": raise HTTPException(422,"System clearing accounts are not transfer sources")
+    if not roles.intersection(TRANSFER_MANAGER_ROLES):
+        owner=db.query(Customer.id).filter_by(user_id=user.id).scalar()
+        if not owner or source.customer_id!=owner: raise HTTPException(403,"Source account is not yours")
+    if source.status!="active": raise HTTPException(409,"Source account is not active")
+    source_customer=db.get(Customer,source.customer_id)
+    if not source_customer or source_customer.status!="active": raise HTTPException(409,"Source customer profile is not KYC approved")
+    source_available=_posted_ledger_balances(db,[source]).get(source.id,Decimal("0.00"))
+    if source_available!=source.balance: raise HTTPException(409,"Source balance does not reconcile to posted ledger entries; manager review is required")
+    if source_available<=Decimal("0.00"): raise HTTPException(409,"Source account has no posted ledger funds")
+    query=db.query(Account,Customer).join(Customer,Customer.id==Account.customer_id).filter(Account.status=="active",Account.currency==source.currency,Account.id!=source.id,Account.account_type!="system_clearing",Customer.status=="active")
+    return [{"id":str(a.id),"label":f"{c.full_name} · account ending {a.account_number[-4:]}","currency":a.currency} for a,c in query.order_by(Customer.full_name,Account.account_number).limit(300)]
 
 @app.patch("/api/accounts/{account_id}")
 def maintain_account(account_id: uuid.UUID, data: AccountStatusUpdate, user: ApplicationUser = Depends(require_roles("administrator", "operations")), db: Session = Depends(get_db)):
@@ -153,8 +283,7 @@ def maintain_account(account_id: uuid.UUID, data: AccountStatusUpdate, user: App
     db.commit()
     return {"id": str(account.id), "status": account.status}
 
-@app.post("/api/transfers", status_code=201)
-def transfer(data: TransferCreate, idempotency_key: str = Header(min_length=8, max_length=128, alias="Idempotency-Key"), user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
+def _post_transfer(data: TransferCreate, idempotency_key: str, user: ApplicationUser, db: Session, allow_system_clearing: bool = False):
     roles = {r.name for r in user.roles}; payload = data.model_dump(mode="json"); digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     try:
         # Serialize requests sharing a key before inspecting the key table.
@@ -170,12 +299,18 @@ def transfer(data: TransferCreate, idempotency_key: str = Header(min_length=8, m
         src, dst = accounts.get(data.source_account_id), accounts.get(data.destination_account_id)
         if not src or not dst: raise HTTPException(404, "Account not found")
         if src.id == dst.id: raise HTTPException(422, "Source and destination must differ")
-        if not roles.intersection({"administrator", "teller", "operations"}):
+        if not roles.intersection(TRANSFER_MANAGER_ROLES):
             own = db.query(Customer.id).filter_by(user_id=user.id).scalar()
             if not own or src.customer_id != own: raise HTTPException(403, "Source account is not yours")
+        if dst.account_type=="system_clearing" or (src.account_type=="system_clearing" and not allow_system_clearing): raise HTTPException(422,"System clearing accounts are available only through the funding operation")
         if src.status != "active" or dst.status != "active": raise HTTPException(409, "Both accounts must be active")
         if src.currency != dst.currency or data.currency != src.currency: raise HTTPException(422, "Currency mismatch")
-        if src.balance < data.amount: raise HTTPException(409, "Insufficient funds")
+        source_customer=db.get(Customer,src.customer_id); destination_customer=db.get(Customer,dst.customer_id)
+        if not source_customer or not destination_customer or source_customer.status!="active" or destination_customer.status!="active": raise HTTPException(409,"Both customer profiles must be KYC approved")
+        available_balances=_posted_ledger_balances(db,[src,dst])
+        source_available=available_balances.get(src.id,Decimal("0.00")); destination_available=available_balances.get(dst.id,Decimal("0.00"))
+        if source_available!=src.balance or destination_available!=dst.balance: raise HTTPException(409,"Account balance does not reconcile to posted ledger entries; manager review is required")
+        if source_available < data.amount: raise HTTPException(409, "Insufficient funds")
         t = Transfer(source_account_id=src.id, destination_account_id=dst.id, amount=data.amount, currency=data.currency, status="posted", reference=data.reference)
         db.add(t); db.flush()
         tx = LedgerTransaction(transfer_id=t.id, description=data.reference or "Internal transfer", status="posted"); db.add(tx); db.flush()
@@ -189,6 +324,10 @@ def transfer(data: TransferCreate, idempotency_key: str = Header(min_length=8, m
         db.rollback(); raise
     except Exception:
         db.rollback(); raise HTTPException(409, "Transfer could not be posted; retry with the same idempotency key") from None
+
+@app.post("/api/transfers", status_code=201)
+def transfer(data: TransferCreate, idempotency_key: str = Header(min_length=8, max_length=128, alias="Idempotency-Key"), user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
+    return _post_transfer(data,idempotency_key,user,db)
 
 @app.get("/api/transfers")
 def list_transfers(user: ApplicationUser = Depends(current_user), db: Session = Depends(get_db)):
